@@ -3,8 +3,7 @@ const {
     default: makeWASocket,
     DisconnectReason,
     fetchLatestBaileysVersion,
-    useMultiFileAuthState, // سنستخدم هذه الدالة الأساسية
-    makeInMemoryStore,
+    useMultiFileAuthState, // هذه هي الدالة الرسمية والموثوقة
 } = require('@whiskeysockets/baileys');
 const { createClient } = require('@supabase/supabase-js');
 const qrcode = require('qrcode-terminal');
@@ -23,38 +22,50 @@ if (!supabaseUrl || !supabaseKey) {
 const supabase = createClient(supabaseUrl, supabaseKey);
 const logger = P({ level: 'silent' });
 
-// --- محول لتخزين الجلسة في Supabase بدلاً من الملفات ---
-const supabaseStore = {
-    writeToFile: async (path, data) => {
+// --- محول بسيط وموثوق لتوجيه عمليات الحفظ والقراءة إلى Supabase ---
+const supabaseAuthStore = (sessionId) => {
+    // كل جلسة لها بادئة خاصة بها في قاعدة البيانات
+    const sessionPrefix = `session-${sessionId}-`;
+
+    const writeData = async (path, data) => {
+        const id = sessionPrefix + path;
         const { error } = await supabase
             .from('whatsapp_sessions')
-            .upsert({ id: path, session_data: data }, { onConflict: 'id' });
+            .upsert({ id: id, session_data: data }, { onConflict: 'id' });
+        if (error) console.error('Error writing to Supabase:', id, error);
+    };
 
-        if (error) {
-            console.error('Error writing to Supabase:', path, error);
-        }
-    },
-    readFromFile: async (path) => {
+    const readData = async (path) => {
+        const id = sessionPrefix + path;
         const { data, error } = await supabase
             .from('whatsapp_sessions')
             .select('session_data')
-            .eq('id', path)
+            .eq('id', id)
             .single();
-
-        if (error && error.code !== 'PGRST116') {
-            console.error('Error reading from Supabase:', path, error);
-        }
+        if (error && error.code !== 'PGRST116') console.error('Error reading from Supabase:', id, error);
         return data ? data.session_data : null;
-    },
-    folderExists: async (path) => {
-        // نتحقق من وجود ملف المصادقة الرئيسي
-        const { data, error } = await supabase
+    };
+
+    const removeData = async (path) => {
+        const id = sessionPrefix + path;
+        const { error } = await supabase
             .from('whatsapp_sessions')
-            .select('id')
-            .eq('id', 'creds.json')
-            .single();
-        return !!data;
-    }
+            .delete()
+            .eq('id', id);
+        if (error) console.error('Error removing from Supabase:', id, error);
+    };
+
+    return {
+        // نستخدم نفس أسماء الدوال التي تتوقعها المكتبة
+        writeToFile: writeData,
+        readFromFile: readData,
+        removeFile: removeData,
+        folderExists: async (folderName) => {
+            // التحقق من وجود ملف المصادقة الرئيسي يكفي
+            const { data } = await supabase.from('whatsapp_sessions').select('id').eq('id', `${sessionPrefix}creds.json`).single();
+            return !!data;
+        }
+    };
 };
 
 const app = express();
@@ -66,10 +77,9 @@ let isConnected = false;
 
 async function startWhatsAppConnection() {
     try {
-        // نستخدم دالة المكتبة الرسمية مع المحول المخصص
         const { state, saveCreds } = await useMultiFileAuthState(
-            'whatsapp_session', // اسم المجلد الوهمي
-            supabaseStore // المحول الخاص بنا
+            'main-session', // معرف الجلسة
+            supabaseAuthStore('main-session') // المحول المخصص الذي سيتعامل مع Supabase
         );
         
         const { version } = await fetchLatestBaileysVersion();
@@ -83,19 +93,19 @@ async function startWhatsAppConnection() {
             shouldSyncHistoryMessage: () => false,
         });
 
-        // هذا الحدث سيقوم الآن بالحفظ في Supabase تلقائياً
+        // هذا هو الربط الصحيح: كلما طلبت المكتبة تحديثاً، سيتم الحفظ في Supabase
         sock.ev.on('creds.update', saveCreds);
 
         sock.ev.on('connection.update', (update) => {
             const { connection, lastDisconnect, qr } = update;
             
             if (qr) {
-                console.log('\n📱 امسح رمز QR (هذه ستكون المرة الأخيرة بإذن الله):');
+                console.log('\n📱 امسح رمز QR (للمرة الأخيرة بإذن الله):');
                 qrcode.generate(qr, { small: true });
             }
             
             if (connection === 'open') {
-                console.log('✅ تم الاتصال بواتساب بنجاح. الجلسة محفوظة الآن.');
+                console.log('✅ تم الاتصال بواتساب بنجاح. الجلسة محفوظة الآن في Supabase.');
                 isConnected = true;
             }
             
@@ -119,9 +129,8 @@ async function startWhatsAppConnection() {
     }
 }
 
-// --- نقاط النهاية (تبقى كما هي) ---
+// --- نقاط النهاية (تبقى كما هي تماماً) ---
 app.get('/api/status', (req, res) => res.json({ success: true, isReady: isConnected, message: isConnected ? 'الخدمة جاهزة' : 'في انتظار الاتصال' }));
-
 app.post('/api/send', async (req, res) => {
     try {
         const { number, message } = req.body;
@@ -139,15 +148,12 @@ app.post('/api/send', async (req, res) => {
         res.status(500).json({ success: false, message: 'خطأ في إرسال الرسالة' });
     }
 });
-
-app.get('/', (req, res) => res.json({ service: "WhatsApp API", version: "2.0.0-stable", ready: isConnected }));
-
+app.get('/', (req, res) => res.json({ service: "WhatsApp API", version: "3.0.0-final", ready: isConnected }));
 function formatPhoneNumber(number) {
     let cleaned = number.replace(/\D/g, '');
     if (cleaned.length === 9 && !cleaned.startsWith('966')) { cleaned = '966' + cleaned; }
     return cleaned + '@s.whatsapp.net';
 }
-
 async function startServer() {
     try {
         await startWhatsAppConnection();
@@ -157,5 +163,4 @@ async function startServer() {
         process.exit(1);
     }
 }
-
 startServer();
