@@ -1,0 +1,28 @@
+# الاعتماديات
+node_modules/
+
+# ملفات البيئة
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# جلسة واتساب (بيانات المصادقة الحساسة)
+whatsapp_session/
+
+# ملفات السجلات
+*.log
+
+# ملفات النظام
+.DS_Store
+Thumbs.db
+
+# ملفات IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ملفات مؤقتة
+*.tmp
+*.temp
