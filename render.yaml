@@ -1,21 +1,16 @@
 services:
-  # تعريف الخدمة الرئيسية (الخادم)
   - type: web
-    # اسم الخدمة (يمكنك اختيار أي اسم)
-    name: whatsapp-api
-    # بيئة التشغيل
+    name: whatsapp-api-supabase
     env: node
-    # الخطة (الخطة المجانية مناسبة للبدء)
     plan: free
-    # أمر بناء المشروع (تثبيت الحزم من package.json)
     buildCommand: "npm install"
-    # أمر بدء تشغيل الخادم (من ملف package.json)
     startCommand: "node index.js"
-    # فحص صحة الخدمة للتأكد من أنها تعمل
     healthCheck:
       path: /api/status
-    # الجزء الأهم: قرص تخزين ثابت للحفاظ على جلسة واتساب
-    disks:
-      - name: whatsapp-session-data # اسم القرص
-        mountPath: ./whatsapp_session # مسار المجلد الذي سيتم حفظه
-        sizeGB: 1 # حجم القرص (1 جيجابايت كافية جداً)
+    envVars:
+      - key: SUPABASE_URL # سيتم إدخال القيمة من لوحة تحكم Render
+        sync: false
+      - key: SUPABASE_KEY # سيتم إدخال القيمة من لوحة تحكم Render
+        sync: false
+      - key: SESSION_ID # معرف فريد للجلسة، مثلاً 'my-session-1'
+        value: "my-whatsapp-session"
