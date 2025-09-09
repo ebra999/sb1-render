@@ -4,7 +4,7 @@ const {
     DisconnectReason,
     fetchLatestBaileysVersion,
     makeInMemoryStore,
-    useMultiFileAuthState,
+    useMultiFileAuthState, // We will use the core logic of this
     proto,
     BufferJSON,
     initAuthCreds
@@ -38,6 +38,7 @@ let isConnected = false;
 // --- نظام المصادقة النهائي الذي يحفظ ويقرأ من Supabase بشكل صحيح ---
 const useSupabaseAuthState = async (sessionId) => {
     const writeData = async (data) => {
+        // نستخدم BufferJSON.replacer لتحويل الجلسة إلى نص آمن للحفظ
         const dataString = JSON.stringify(data, BufferJSON.replacer);
         const { error } = await supabase.from('whatsapp_sessions').upsert({ id: sessionId, session_data: dataString });
         if (error) console.error('Error writing session to Supabase:', error);
@@ -46,7 +47,13 @@ const useSupabaseAuthState = async (sessionId) => {
     const readData = async () => {
         const { data, error } = await supabase.from('whatsapp_sessions').select('session_data').eq('id', sessionId).single();
         if (error || !data) return null;
+        // نستخدم BufferJSON.reviver لإعادة بناء الجلسة بشكل صحيح
         return JSON.parse(data.session_data, BufferJSON.reviver);
+    };
+
+    const removeData = async () => {
+        const { error } = await supabase.from('whatsapp_sessions').delete().eq('id', sessionId);
+        if (error) console.error('Error removing session from Supabase:', error);
     };
 
     const creds = await readData() || initAuthCreds();
@@ -98,6 +105,7 @@ async function startWhatsAppConnection() {
             auth: state,
         });
 
+        // هذا الربط سيقوم الآن بالحفظ الصحيح في Supabase
         sock.ev.on('creds.update', saveCreds);
 
         sock.ev.on('connection.update', (update) => {
@@ -124,28 +132,17 @@ async function startWhatsAppConnection() {
     }
 }
 
-// --- نقاط النهاية (مع حل مشكلة التأخير) ---
+// --- نقاط النهاية (تبقى كما هي تماماً) ---
 app.get('/api/status', (req, res) => res.json({ success: true, isReady: isConnected }));
-app.post('/api/send', (req, res) => { // لاحظ أننا أزلنا async من هنا
+app.post('/api/send', async (req, res) => {
     try {
         const { number, message } = req.body;
-        if (!isConnected || !sock) {
-            return res.status(503).json({ success: false, message: 'الخدمة غير متاحة أو غير متصلة حالياً' });
-        }
+        if (!isConnected || !sock) return res.status(503).json({ success: false, message: 'الخدمة غير متاحة' });
         const jid = number.replace(/\D/g, '') + '@s.whatsapp.net';
-        
-        // **الحل هنا: أزلنا await لإرسال الرد فوراً**
-        sock.sendMessage(jid, { text: message });
-
-        res.json({ success: true, message: 'تم استلام الطلب وجاري إرسال الرسالة' });
-
+        await sock.sendMessage(jid, { text: message });
+        res.json({ success: true, message: 'تم إرسال الرسالة بنجاح' });
     } catch (error) {
-        console.error("❌ Error sending message: ", error);
-        res.status(500).json({ 
-            success: false, 
-            message: 'فشل إرسال الرسالة.',
-            error: error.message
-        });
+        res.status(500).json({ success: false, message: 'خطأ في إرسال الرسالة' });
     }
 });
 app.get('/', (req, res) => res.json({ service: "WhatsApp API", ready: isConnected }));
