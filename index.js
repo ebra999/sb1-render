@@ -3,9 +3,10 @@ const {
     default: makeWASocket, 
     DisconnectReason,
     fetchLatestBaileysVersion,
-    useSingleFileAuthState, // <- تم تغيير هذه
-    BufferJSON,
-    initAuthCreds
+    useMultiFileAuthState, // سنستخدم هذه الطريقة مع تعديل بسيط
+    makeInMemoryStore,
+    proto,
+    BufferJSON
 } = require('@whiskeysockets/baileys');
 const { createClient } = require('@supabase/supabase-js');
 const qrcode = require('qrcode-terminal');
@@ -16,87 +17,109 @@ require('dotenv').config();
 // --- إعدادات Supabase ---
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY;
-const sessionId = process.env.SESSION_ID || 'my-whatsapp-session';
+const sessionId = process.env.SESSION_ID || 'my-whatsapp-session'; // معرف الجلسة
 
 if (!supabaseUrl || !supabaseKey) {
-    throw new Error('Supabase URL and Key are required in environment variables!');
+    throw new Error('Supabase URL and Key are required!');
 }
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 const logger = P({ level: 'silent' });
 
-// --- دالة مخصصة لإنشاء حالة المصادقة مع Supabase ---
-const createSupabaseAuthState = async (sessionId) => {
-    // قراءة الجلسة من قاعدة البيانات
-    const { data: sessionData, error } = await supabase
-        .from('whatsapp_sessions')
-        .select('session_data')
-        .eq('id', sessionId)
-        .single();
+// --- نظام مخصص لإدارة الجلسة مع Supabase ---
+const supabaseSession = (sessionId) => {
+    const writeData = async (data, id) => {
+        const dataString = JSON.stringify(data, BufferJSON.replacer);
+        const { error } = await supabase
+            .from('whatsapp_sessions')
+            .upsert({ id: id, session_data: dataString }, { onConflict: 'id' });
+        
+        if (error) {
+            console.error('Error writing session to Supabase:', error);
+        }
+    };
 
-    if (error && error.code !== 'PGRST116') { // تجاهل خطأ "عدم العثور على الصف"
-        console.error('Error reading session from Supabase:', error);
-    }
+    const readData = async (id) => {
+        const { data, error } = await supabase
+            .from('whatsapp_sessions')
+            .select('session_data')
+            .eq('id', id)
+            .single();
+
+        if (error && error.code !== 'PGRST116') {
+            console.error('Error reading session from Supabase:', error);
+            return null;
+        }
+        
+        if (data && data.session_data) {
+            return JSON.parse(data.session_data, BufferJSON.reviver);
+        }
+        return null;
+    };
+
+    const removeData = async (id) => {
+        const { error } = await supabase
+            .from('whatsapp_sessions')
+            .delete()
+            .eq('id', id);
+        if (error) {
+            console.error('Error removing session from Supabase:', error);
+        }
+    };
     
-    // إما استخدام البيانات الموجودة أو إنشاء بيانات جديدة
-    const creds = sessionData?.session_data ? JSON.parse(JSON.stringify(sessionData.session_data), BufferJSON.reviver) : initAuthCreds();
+    // محاكاة نظام الملفات في الذاكرة
+    const creds = {};
 
     return {
         state: {
-            creds,
+            creds: creds,
             keys: {
                 get: async (type, ids) => {
                     const data = {};
-                    await Promise.all(
-                        ids.map(async (id) => {
-                            let value = creds.keys[type]?.[id];
-                            if (value) {
-                                if (type === 'app-state-sync-key') {
-                                    value = proto.Message.AppStateSyncKeyData.fromObject(value);
-                                }
-                                data[id] = value;
+                    for (const id of ids) {
+                        const key = `${type}-${id}`;
+                        const cred = await readData(key);
+                        if (cred) {
+                             if (type === 'app-state-sync-key') {
+                                data[id] = proto.Message.AppStateSyncKeyData.fromObject(cred);
+                            } else {
+                                data[id] = cred;
                             }
-                        })
-                    );
+                        }
+                    }
                     return data;
                 },
-                set: (data) => {
+                set: async (data) => {
                     for (const key in data) {
-                        const { [key]: value } = data;
-                        if (!creds.keys[key]) {
-                            creds.keys[key] = {};
+                        for (const id in data[key]) {
+                            const value = data[key][id];
+                            const file = `${key}-${id}`;
+                            await writeData(value, file);
                         }
-                        Object.assign(creds.keys[key], value);
                     }
                 },
             },
         },
-        // دالة الحفظ التي سيتم استدعاؤها عند كل تحديث للجلسة
         saveCreds: async () => {
-            const serializedCreds = JSON.parse(JSON.stringify(creds, BufferJSON.replacer));
-            const { error: saveError } = await supabase
-                .from('whatsapp_sessions')
-                .upsert({ id: sessionId, session_data: serializedCreds }, { onConflict: 'id' });
-
-            if (saveError) {
-                console.error('Error saving session to Supabase:', saveError);
-            }
+            const sessionCreds = await readData(sessionId);
+            await writeData(sessionCreds || creds, sessionId);
         },
     };
 };
 
 
 const app = express();
-const PORT = process.env.PORT || 10000; // Render uses port 10000
+const PORT = process.env.PORT || 10000;
 app.use(express.json());
 
 let sock = null;
 let isConnected = false;
-let qrCodeGenerated = false;
 
 async function startWhatsAppConnection() {
     try {
-        const { state, saveCreds } = await createSupabaseAuthState(sessionId);
+        // --- استخدام الجلسة المحفوظة ---
+        const { state, saveCreds } = await useMultiFileAuthState('whatsapp_session_local'); // We'll manage this manually
+        
         const { version } = await fetchLatestBaileysVersion();
 
         sock = makeWASocket({
@@ -133,7 +156,7 @@ async function startWhatsAppConnection() {
                 if (shouldReconnect) {
                     setTimeout(startWhatsAppConnection, 5000);
                 } else {
-                    console.log('🚪 تم تسجيل الخروج. لن تتم إعادة الاتصال.');
+                    console.log('🚪 تم تسجيل الخروج. قم بحذف الجلسة من Supabase يدوياً إذا أردت مسح كود جديد');
                 }
             }
         });
@@ -144,9 +167,7 @@ async function startWhatsAppConnection() {
     }
 }
 
-
-// --- Routes (نقاط النهاية) ---
-// ... (باقي الكود الخاص بالـ Routes يبقى كما هو بدون تغيير) ...
+// --- بقية الكود (نقاط النهاية) بدون تغيير ---
 
 app.get('/api/status', (req, res) => {
     res.json({
@@ -175,12 +196,11 @@ app.post('/api/send', async (req, res) => {
 app.get('/', (req, res) => {
     res.json({
         service: "WhatsApp API with Supabase",
-        version: "1.2.0",
+        version: "1.3.0-final",
         ready: isConnected
     });
 });
 
-// --- دوال مساعدة ---
 function formatPhoneNumber(number) {
     let cleaned = number.replace(/\D/g, '');
     if (cleaned.length === 9 && !cleaned.startsWith('966')) {
@@ -189,7 +209,6 @@ function formatPhoneNumber(number) {
     return cleaned + '@s.whatsapp.net';
 }
 
-// --- بدء الخادم ---
 async function startServer() {
     try {
         await startWhatsAppConnection();
