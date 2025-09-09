@@ -1,9 +1,9 @@
 const express = require('express');
-const { 
-    default: makeWASocket, 
+const {
+    default: makeWASocket,
     DisconnectReason,
     fetchLatestBaileysVersion,
-    useMultiFileAuthState, // سنستخدم هذه الطريقة مع تعديل بسيط
+    useMultiFileAuthState, // We will use this as a base
     makeInMemoryStore,
     proto,
     BufferJSON
@@ -17,7 +17,6 @@ require('dotenv').config();
 // --- إعدادات Supabase ---
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY;
-const sessionId = process.env.SESSION_ID || 'my-whatsapp-session'; // معرف الجلسة
 
 if (!supabaseUrl || !supabaseKey) {
     throw new Error('Supabase URL and Key are required!');
@@ -27,15 +26,16 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 const logger = P({ level: 'silent' });
 
 // --- نظام مخصص لإدارة الجلسة مع Supabase ---
-const supabaseSession = (sessionId) => {
+const useSupabaseAuthState = async (sessionId) => {
     const writeData = async (data, id) => {
         const dataString = JSON.stringify(data, BufferJSON.replacer);
+        // Use the session ID as the primary key
         const { error } = await supabase
             .from('whatsapp_sessions')
-            .upsert({ id: id, session_data: dataString }, { onConflict: 'id' });
+            .upsert({ id: id, session_data: { [id]: dataString } }, { onConflict: 'id' });
         
         if (error) {
-            console.error('Error writing session to Supabase:', error);
+            console.error('Error writing session data to Supabase:', id, error);
         }
     };
 
@@ -51,8 +51,8 @@ const supabaseSession = (sessionId) => {
             return null;
         }
         
-        if (data && data.session_data) {
-            return JSON.parse(data.session_data, BufferJSON.reviver);
+        if (data && data.session_data && data.session_data[id]) {
+            return JSON.parse(data.session_data[id], BufferJSON.reviver);
         }
         return null;
     };
@@ -62,47 +62,54 @@ const supabaseSession = (sessionId) => {
             .from('whatsapp_sessions')
             .delete()
             .eq('id', id);
+
         if (error) {
-            console.error('Error removing session from Supabase:', error);
+            console.error('Error removing session data from Supabase:', error);
         }
     };
-    
-    // محاكاة نظام الملفات في الذاكرة
-    const creds = {};
+
+    const creds = await readData('creds') || {
+        noiseKey: Buffer.alloc(32),
+        signedIdentityKey: Buffer.alloc(32),
+        signedPreKey: { keyId: 0, keyPair: { private: Buffer.alloc(32), public: Buffer.alloc(32) }, signature: Buffer.alloc(64) },
+        registrationId: 0,
+        advSecretKey: '',
+        processedHistoryMessages: [],
+        nextPreKeyId: 1,
+        firstUnuploadedPreKeyId: 1,
+        accountSettings: { unarchiveChats: false },
+    };
 
     return {
         state: {
-            creds: creds,
+            creds,
             keys: {
                 get: async (type, ids) => {
                     const data = {};
-                    for (const id of ids) {
-                        const key = `${type}-${id}`;
-                        const cred = await readData(key);
-                        if (cred) {
-                             if (type === 'app-state-sync-key') {
-                                data[id] = proto.Message.AppStateSyncKeyData.fromObject(cred);
-                            } else {
-                                data[id] = cred;
+                    await Promise.all(
+                        ids.map(async (id) => {
+                            let value = await readData(`${type}-${id}`);
+                            if (type === 'app-state-sync-key' && value) {
+                                value = proto.Message.AppStateSyncKeyData.fromObject(value);
                             }
-                        }
-                    }
+                            data[id] = value;
+                        })
+                    );
                     return data;
                 },
                 set: async (data) => {
-                    for (const key in data) {
-                        for (const id in data[key]) {
-                            const value = data[key][id];
-                            const file = `${key}-${id}`;
-                            await writeData(value, file);
+                    for (const category in data) {
+                        for (const key in data[category]) {
+                            const value = data[category][key];
+                            const id = `${category}-${key}`;
+                            await writeData(value, id);
                         }
                     }
                 },
             },
         },
         saveCreds: async () => {
-            const sessionCreds = await readData(sessionId);
-            await writeData(sessionCreds || creds, sessionId);
+            await writeData('creds', creds);
         },
     };
 };
@@ -117,9 +124,7 @@ let isConnected = false;
 
 async function startWhatsAppConnection() {
     try {
-        // --- استخدام الجلسة المحفوظة ---
-        const { state, saveCreds } = await useMultiFileAuthState('whatsapp_session_local'); // We'll manage this manually
-        
+        const { state, saveCreds } = await useSupabaseAuthState('main-session');
         const { version } = await fetchLatestBaileysVersion();
 
         sock = makeWASocket({
@@ -137,13 +142,12 @@ async function startWhatsAppConnection() {
             const { connection, lastDisconnect, qr } = update;
             
             if (qr) {
-                console.log('\n📱 امسح رمز QR التالي بواتساب:');
+                console.log('\n📱 امسح رمز QR التالي بواتساب (هذه هي المرة الأخيرة!):');
                 qrcode.generate(qr, { small: true });
-                console.log('\n🔄 في انتظار المسح...\n');
             }
             
             if (connection === 'open') {
-                console.log('✅ تم الاتصال بواتساب بنجاح');
+                console.log('✅ تم الاتصال بواتساب بنجاح والجلسة الآن محفوظة.');
                 isConnected = true;
             }
             
@@ -156,7 +160,7 @@ async function startWhatsAppConnection() {
                 if (shouldReconnect) {
                     setTimeout(startWhatsAppConnection, 5000);
                 } else {
-                    console.log('🚪 تم تسجيل الخروج. قم بحذف الجلسة من Supabase يدوياً إذا أردت مسح كود جديد');
+                    console.log('🚪 تم تسجيل الخروج. لن تتم إعادة الاتصال.');
                 }
             }
         });
@@ -168,13 +172,8 @@ async function startWhatsAppConnection() {
 }
 
 // --- بقية الكود (نقاط النهاية) بدون تغيير ---
-
 app.get('/api/status', (req, res) => {
-    res.json({
-        success: true,
-        isReady: isConnected,
-        message: isConnected ? 'الخدمة جاهزة' : 'في انتظار الاتصال'
-    });
+    res.json({ success: true, isReady: isConnected, message: isConnected ? 'الخدمة جاهزة' : 'في انتظار الاتصال' });
 });
 app.post('/api/send', async (req, res) => {
     try {
@@ -194,32 +193,20 @@ app.post('/api/send', async (req, res) => {
     }
 });
 app.get('/', (req, res) => {
-    res.json({
-        service: "WhatsApp API with Supabase",
-        version: "1.3.0-final",
-        ready: isConnected
-    });
+    res.json({ service: "WhatsApp API with Supabase", version: "1.4.0-stable", ready: isConnected });
 });
-
 function formatPhoneNumber(number) {
     let cleaned = number.replace(/\D/g, '');
-    if (cleaned.length === 9 && !cleaned.startsWith('966')) {
-        cleaned = '966' + cleaned;
-    }
+    if (cleaned.length === 9 && !cleaned.startsWith('966')) { cleaned = '966' + cleaned; }
     return cleaned + '@s.whatsapp.net';
 }
-
 async function startServer() {
     try {
         await startWhatsAppConnection();
-        app.listen(PORT, () => {
-            console.log(`🌐 الخادم يعمل الآن على البورت ${PORT}`);
-            console.log(`💡 الجلسة تتم مزامنتها مع قاعدة بيانات Supabase.`);
-        });
+        app.listen(PORT, () => console.log(`🌐 الخادم يعمل على البورت ${PORT}`));
     } catch (error) {
         console.error('❌ فشل في بدء الخادم:', error);
         process.exit(1);
     }
 }
-
 startServer();
