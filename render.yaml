@@ -5,12 +5,12 @@ services:
     plan: free
     buildCommand: "npm install"
     startCommand: "node index.js"
-    healthCheck:
-      path: /api/status
+    # --- السطر الصحيح هنا ---
+    healthCheckPath: /api/status
     envVars:
-      - key: SUPABASE_URL # سيتم إدخال القيمة من لوحة تحكم Render
+      - key: SUPABASE_URL
         sync: false
-      - key: SUPABASE_KEY # سيتم إدخال القيمة من لوحة تحكم Render
+      - key: SUPABASE_KEY
         sync: false
-      - key: SESSION_ID # معرف فريد للجلسة، مثلاً 'my-session-1'
+      - key: SESSION_ID
         value: "my-whatsapp-session"
